@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Slurm settings and generated run state
+cluster.local.sh
+environment.local.sh
+.slurm/
+runs/

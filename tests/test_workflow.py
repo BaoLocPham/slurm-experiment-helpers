@@ -1,0 +1,246 @@
+"""Exercise the CLI and batch entrypoint without a Slurm installation."""
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MOCK = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+with open(os.environ["MOCK_CALLS"], "a") as stream:
+    stream.write(json.dumps([name, args]) + "\n")
+if name == "sbatch":
+    if os.environ.get("MOCK_SUBMIT_FAIL"):
+        sys.exit(7)
+    print(os.environ.get("MOCK_JOB_ID", "12345") + ";test-cluster")
+elif name == "srun":
+    # All helpers use --option=value except --pty, --overlap.
+    while args and args[0].startswith("--"):
+        args.pop(0)
+    sys.exit(subprocess.run(args).returncode)
+elif name == "squeue":
+    print(os.environ.get("MOCK_JOB_STATE", "RUNNING"))
+elif name == "sacct":
+    print("JobID|State|ExitCode\n12345|COMPLETED|0:0")
+'''
+
+
+class WorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="slurm-template-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.project = self.base / "project with spaces"
+        shutil.copytree(
+            ROOT,
+            self.project,
+            ignore=shutil.ignore_patterns(".git", ".slurm", "__pycache__", "cluster.local.sh", "environment.local.sh"),
+        )
+        self.storage = self.base / "shared storage"
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        for name in ("sbatch", "srun", "squeue", "sacct", "scancel", "scontrol", "sinfo"):
+            script = self.bin / name
+            script.write_text(MOCK)
+            script.chmod(0o755)
+        self.calls_path = self.base / "calls.jsonl"
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("EXP_", "SLURM_", "SBATCH_", "MOCK_"))}
+        self.env.update(
+            PATH=f"{self.bin}:{os.environ['PATH']}",
+            EXP_STORAGE=str(self.storage),
+            MOCK_CALLS=str(self.calls_path),
+        )
+
+    def cli(self, *args, ok=True, env=None):
+        result = subprocess.run(
+            [str(self.project / "slurm"), *args],
+            cwd=self.base,  # Commands work outside the project directory, too.
+            env={**self.env, **(env or {})},
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        return result
+
+    def calls(self, name):
+        if not self.calls_path.exists():
+            return []
+        return [args for tool, args in map(json.loads, self.calls_path.read_text().splitlines()) if tool == name]
+
+    def run_dir(self, *prefix):
+        return Path(self.cli(*prefix, "path").stdout.strip())
+
+    def batch(self, run, **updates):
+        return subprocess.run(
+            ["bash", str(self.project / "batch/job.sbatch"), str(run)],
+            cwd=self.base,
+            env={**self.env, "SLURM_JOB_ID": "12345", **updates},
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+
+    def test_dry_run_needs_no_slurm_or_writable_storage(self):
+        result = self.cli("submit", "preview", "--dry-run", "--time=02:00:00", "--", "python3", "train.py", "--seed", "4")
+        self.assertIn("--time=02:00:00", result.stdout)
+        self.assertFalse(self.storage.exists())
+        self.assertFalse((self.project / ".slurm").exists())
+        self.assertEqual(self.calls("sbatch"), [])
+
+    def test_submit_records_exact_arguments_and_runs_example(self):
+        result = self.cli("submit", "baseline", "--cpus-per-task=6")
+        self.assertEqual(result.stdout, "12345\n")
+        run = self.run_dir()
+        self.assertTrue((run / "command.argv").exists())
+        args = self.calls("sbatch")[0]
+        self.assertIn(f"--chdir={self.project}", args)
+        self.assertIn(f"--output={run}/logs/%j.out", args)
+        result = self.batch(run, SLURM_CPUS_PER_TASK="6")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--cpus-per-task=6", self.calls("srun")[-1])
+        metrics = json.loads((run / "results/12345/metrics.json").read_text())
+        self.assertEqual(metrics["seed"], 0)
+        self.assertEqual((run / "exit-code-12345.txt").read_text(), "0\n")
+
+    def test_environment_is_snapshotted_and_arguments_are_literal(self):
+        activation = self.project / "environment.local.sh"
+        activation.write_text("export TEST_SNAPSHOT=before\n")
+        marker = self.base / "must-not-exist"
+        literal = f"space ; $(touch '{marker}') `touch '{marker}'`"
+        code = "import json, os, sys; print(json.dumps([os.environ['TEST_SNAPSHOT'], sys.argv[1]]))"
+        self.cli("submit", "literal", "--", "python3", "-c", code, literal)
+        run = self.run_dir()
+        activation.write_text("export TEST_SNAPSHOT=after\n")
+        result = self.batch(run)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(json.dumps(["before", literal]), result.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_application_failure_is_not_hidden(self):
+        self.cli("submit", "failure", "--", "bash", "-c", "exit 42")
+        run = self.run_dir()
+        result = self.batch(run)
+        self.assertEqual(result.returncode, 42)
+        self.assertEqual((run / "exit-code-12345.txt").read_text(), "42\n")
+
+    def test_failed_submission_preserves_previous_latest(self):
+        self.cli("submit", "good")
+        run = self.run_dir()
+        result = self.cli("submit", "bad", ok=False, env={"MOCK_SUBMIT_FAIL": "1"})
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(self.run_dir(), run)
+        self.assertIn("Check the queue before retrying", result.stderr)
+
+    def test_run_name_reuse_does_not_overwrite(self):
+        self.cli("submit", "same-name")
+        first = self.run_dir()
+        self.cli("submit", "same-name", env={"MOCK_JOB_ID": "12346"})
+        second = self.run_dir()
+        self.assertNotEqual(first, second)
+        self.assertEqual(Path(self.cli("path", "12345").stdout.strip()), first)
+
+    def test_cpu_profile_clears_gpu_resources_and_named_profile_wins(self):
+        (self.project / "cluster.local.sh").write_text("EXP_PARTITION=stale\nEXP_CONSTRAINT=stale\nEXP_GRES=gpu:8\nEXP_ACCOUNT=research\n")
+        self.cli("--cluster", "cpu", "submit", "cpu")
+        args = self.calls("sbatch")[-1]
+        self.assertIn("--partition=cpu", args)
+        self.assertIn("--account=research", args)
+        self.assertFalse(any(arg.startswith(("--gres=", "--constraint=")) for arg in args))
+        self.cli("--cluster", "rohan", "submit", "gpu", "--gres=gpu:v100:2")
+        args = self.calls("sbatch")[-1]
+        self.assertIn("--partition=gpu", args)
+        self.assertIn("--constraint=gpu-32G", args)
+        self.assertEqual([a for a in args if a.startswith("--gres=")][-1], "--gres=gpu:v100:2")
+
+    def test_gondor_gpu_selection_and_profile_job_index(self):
+        self.cli("--cluster", "gondor", "submit", "gpu", env={"EXP_GPU": "h100"})
+        args = self.calls("sbatch")[-1]
+        self.assertIn("--partition=gpu-large", args)
+        self.assertIn("--gres=gpu:h100:1", args)
+        self.cli("path", ok=False)  # Default local profile has no job yet.
+        self.assertTrue(self.run_dir("--cluster", "gondor").exists())
+
+    def test_array_seed_exit_record_and_logs(self):
+        self.cli("submit", "seeds", "--array=0-4%2")
+        run = self.run_dir()
+        self.assertIn(f"--output={run}/logs/%A_%a.out", self.calls("sbatch")[-1])
+        result = self.batch(run, SLURM_JOB_ID="12348", SLURM_ARRAY_JOB_ID="12345", SLURM_ARRAY_TASK_ID="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metrics = json.loads((run / "results/12348/metrics.json").read_text())
+        self.assertEqual(metrics["seed"], 3)
+        self.assertTrue((run / "exit-code-12345_3.txt").exists())
+        (run / "logs/12345_3.out").write_text("task output\n")
+        (run / "logs/12345_3.err").touch()
+        self.assertIn("task output", self.cli("logs", "12345_3", "--once").stdout)
+        self.assertIn("select a task", self.cli("logs", "--once", ok=False).stderr)
+
+    def test_logs_status_and_cancel_use_saved_job(self):
+        self.cli("submit", "baseline")
+        run = self.run_dir()
+        (run / "logs/12345.out").write_text("hello from experiment\n")
+        (run / "logs/12345.err").write_text("diagnostic\n")
+        self.assertIn("hello from experiment", self.cli("logs", "--once").stdout)
+        self.assertIn("COMPLETED", self.cli("status").stdout)
+        self.cli("cancel")
+        self.assertEqual(self.calls("scancel"), [["12345"]])
+
+    def test_attach_uses_snapshot_and_requires_running(self):
+        activation = self.project / "environment.local.sh"
+        activation.write_text("export TEST_SNAPSHOT=original\n")
+        self.cli("submit", "baseline")
+        activation.write_text("export TEST_SNAPSHOT=modified\n")
+        result = self.cli("attach", "--", "python3", "-c", "import os; print(os.environ['TEST_SNAPSHOT'])")
+        self.assertEqual(result.stdout, "original\n")
+        self.assertIn("--overlap", self.calls("srun")[-1])
+        result = self.cli("attach", "--", "true", ok=False, env={"MOCK_JOB_STATE": "PENDING"})
+        self.assertIn("RUNNING", result.stderr)
+
+    def test_interactive_initializes_selected_profile(self):
+        # Execute the actual rcfile without a terminal to verify environment setup.
+        code = f'source "{self.project}/scripts/interactive.sh"; printf "%s" "$EXP_PARTITION"'
+        result = subprocess.run(["bash", "-c", code], env={**self.env, "EXP_CLUSTER": "cpu"}, text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "cpu")
+        preview = self.cli("--cluster", "gondor", "interactive", "--dry-run")
+        self.assertIn("--pty", preview.stdout)
+        self.assertIn("--gres=gpu:a100:1", preview.stdout)
+
+    def test_cpu_smoke_does_not_need_gpu_tools(self):
+        self.cli("--cluster", "cpu", "smoke")
+        run = self.run_dir("--cluster", "cpu")
+        result = self.batch(run)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Compute-node smoke check passed", result.stdout)
+        self.assertIn("--time=00:05:00", self.calls("sbatch")[-1])
+
+    def test_invalid_arguments_cannot_change_managed_paths_or_cancel_all(self):
+        for args in (
+            ("submit", "../escape"),
+            ("submit", "bad", "--output=/tmp/override"),
+            ("submit", "bad", "--nodes=2"),
+            ("submit", "bad", "--time", "02:00:00"),
+            ("submit", "bad", "--"),
+            ("cancel", "--all"),
+            ("--cluster", "../../escape", "config"),
+            ("smoke", "--", "arbitrary-command"),
+        ):
+            with self.subTest(args=args):
+                self.cli(*args, ok=False)
+        self.assertEqual(self.calls("sbatch"), [])
+        self.assertEqual(self.calls("scancel"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
