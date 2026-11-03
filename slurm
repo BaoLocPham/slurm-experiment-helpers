@@ -12,6 +12,7 @@ Usage: ./slurm [--cluster local|rohan|gondor|cpu] COMMAND [ARGUMENTS...]
   submit NAME [OPTIONS...] [-- CMD...] Submit experiment (default: experiments/run.sh)
   interactive [OPTIONS...]            Open a shell in a new allocation
   status [JOB_ID]                     Queue and accounting (default: latest)
+  queue [JOB_ID]                      Active jobs with pending reasons and dependencies
   logs [JOB_ID] [--once]              Follow stdout/stderr (default: latest)
   path [JOB_ID]                       Print the saved run directory
   attach [JOB_ID] [-- CMD...]         Shell/command in an existing running job
@@ -19,6 +20,8 @@ Usage: ./slurm [--cluster local|rohan|gondor|cpu] COMMAND [ARGUMENTS...]
 
 Scheduling OPTIONS use --option=value, for example --time=04:00:00 --gres=gpu:2.
 submit/interactive also accept --dry-run (prints commands, does not allocate).
+submit accepts --continue-after JOB_ID (or --continue-after=JOB_ID) for afterany.
+Supply your application's resume/checkpoint arguments after -- when needed.
 Put all experiment arguments AFTER --. No shell evaluation is performed.
 HELP
 }
@@ -37,6 +40,16 @@ submit() {
     local label=${1:-}; (( $# == 0 )) || shift
     [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'Supply a run name using letters, digits, dots, underscores, or dashes.'
     parse_options "$@"
+    EXP_PREDECESSOR_JOB_ID=$continue_after
+    EXP_PREVIOUS_RUN_DIR=''
+    if [[ "$continuation" == true ]]; then
+        local previous_record="$EXP_STATE_DIR/jobs/$continue_after"
+        if [[ -r "$previous_record" ]]; then
+            read -r EXP_PREVIOUS_RUN_DIR < "$previous_record"
+            [[ -d "$EXP_PREVIOUS_RUN_DIR" ]] || die "Predecessor run directory is unavailable: $EXP_PREVIOUS_RUN_DIR"
+        fi
+        echo "Queueing after job $continue_after ends (afterany). Pass your application's resume/checkpoint arguments explicitly." >&2
+    fi
     (( ${#command_args[@]} )) || command_args=(bash "$EXP_PROJECT_ROOT/experiments/run.sh")
     resource_options
     if [[ "$dry_run" == true ]]; then
@@ -55,7 +68,7 @@ submit() {
     mkdir -p "$run_dir/logs"
     # A small, explicit snapshot avoids dumping the submitting environment.
     local variable
-    for variable in EXP_PROJECT_ROOT EXP_CLUSTER EXP_RUNS_DIR EXP_CACHE_DIR EXP_PARTITION EXP_GRES EXP_CONSTRAINT EXP_CPUS EXP_MEM EXP_TIME EXP_ACCOUNT EXP_QOS EXP_MAIL_USER; do
+    for variable in EXP_PROJECT_ROOT EXP_CLUSTER EXP_RUNS_DIR EXP_CACHE_DIR EXP_PARTITION EXP_GRES EXP_CONSTRAINT EXP_CPUS EXP_MEM EXP_TIME EXP_ACCOUNT EXP_QOS EXP_MAIL_USER EXP_PREDECESSOR_JOB_ID EXP_PREVIOUS_RUN_DIR; do
         printf 'export %s=%q\n' "$variable" "${!variable}"
     done > "$run_dir/settings.sh"
     printf '%s\0' "${command_args[@]}" > "$run_dir/command.argv"
@@ -121,12 +134,14 @@ case "$action" in
     submit) submit "$@" ;;
     smoke)
         parse_options "$@"
+        [[ "$continuation" == false ]] || die '--continue-after is supported for submit only.'
         (( ${#command_args[@]} == 0 )) || die 'smoke accepts resource options only.'
         smoke_options=("${options[@]}")
         [[ "$dry_run" == false ]] || smoke_options+=(--dry-run)
         submit smoke --time=00:05:00 --mem=4G "${smoke_options[@]}" -- bash "$EXP_PROJECT_ROOT/experiments/smoke.sh" ;;
     interactive)
         parse_options "$@"
+        [[ "$continuation" == false ]] || die '--continue-after is supported for submit only.'
         [[ "$array" == false && ${#command_args[@]} == 0 ]] || die 'interactive takes resource options only.'
         resource_options
         invocation=(srun "${resources[@]}" "${options[@]}" --export=ALL --chdir="$EXP_PROJECT_ROOT"
@@ -136,12 +151,22 @@ case "$action" in
         (( $# <= 1 )) || die 'path accepts at most one job ID.'
         resolve_job "${1:-}"; resolve_run
         printf '%s\n' "$run_dir" ;;
+    queue)
+        (( $# <= 1 )) || die 'queue accepts at most one job ID.'
+        need squeue
+        if (( $# )); then
+            resolve_job "$1"
+            selection=(--jobs="$job_id")
+        else
+            selection=(--user="$(id -un)")
+        fi
+        exec squeue "${selection[@]}" --format='%.18i %.24j %.12P %.9T %.10M %.40R %E' ;;
     status|cancel)
         (( $# <= 1 )) || die "$action accepts at most one job ID."
         resolve_job "${1:-}"
         if [[ "$action" == cancel ]]; then need scancel; exec scancel "$job_id"; fi
         need squeue
-        squeue -j "$job_id" -o '%.18i %.12P %.9T %.10M %.40R' || echo 'Queue query failed; checking accounting.' >&2
+        squeue -j "$job_id" -o '%.18i %.12P %.9T %.10M %.40R %E' || echo 'Queue query failed; checking accounting.' >&2
         if command -v sacct >/dev/null 2>&1; then
             sacct -j "$job_id" --format=JobID,JobName,State,Elapsed,MaxRSS,AllocTRES,ExitCode -P
         else

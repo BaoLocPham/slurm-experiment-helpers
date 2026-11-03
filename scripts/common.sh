@@ -47,16 +47,32 @@ resource_options() {
 # launch topology, and receipt handling under the wrapper's control.
 parse_options() {
     options=(); command_args=(); array=false; dry_run=false
+    continuation=false; continue_after=''; has_dependency=false
     while (( $# )); do
         case "$1" in
             --) shift; (( $# )) || die 'Expected a command after --.'; command_args=("$@"); break ;;
             --dry-run) dry_run=true ;;
+            --continue-after|--continue-after=*)
+                [[ "$continuation" == false ]] || die 'Specify --continue-after once.'
+                if [[ "$1" == --continue-after=* ]]; then
+                    continue_after=${1#*=}
+                else
+                    (( $# >= 2 )) || die '--continue-after requires a positive numeric JOB_ID.'
+                    continue_after=$2; shift
+                fi
+                [[ "$continue_after" =~ ^[1-9][0-9]*$ ]] || die '--continue-after requires a positive numeric JOB_ID.'
+                continuation=true ;;
             --array=*) array=true; options+=("$1") ;;
-            --time=*|--mem=*|--cpus-per-task=*|--gres=*|--constraint=*|--partition=*|--account=*|--qos=*|--dependency=*|--reservation=*|--exclude=*|--nodelist=*) options+=("$1") ;;
+            --dependency=*) has_dependency=true; options+=("$1") ;;
+            --time=*|--mem=*|--cpus-per-task=*|--gres=*|--constraint=*|--partition=*|--account=*|--qos=*|--reservation=*|--exclude=*|--nodelist=*) options+=("$1") ;;
             *) die "Unsupported option: $1. Use --option=value; put the experiment command after --. See ./slurm help." ;;
         esac
         shift
     done
+    if [[ "$continuation" == true ]]; then
+        [[ "$has_dependency" == false ]] || die 'Use --continue-after without another --dependency option.'
+        options+=(--dependency="afterany:$continue_after")
+    fi
 }
 
 resolve_job() {

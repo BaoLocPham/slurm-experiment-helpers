@@ -27,7 +27,13 @@ elif name == "srun":
         args.pop(0)
     sys.exit(subprocess.run(args).returncode)
 elif name == "squeue":
-    print(os.environ.get("MOCK_JOB_STATE", "RUNNING"))
+    state = os.environ.get("MOCK_JOB_STATE", "RUNNING")
+    if "--format=%T" in args:
+        print(state)
+    else:
+        dependency = os.environ.get("MOCK_JOB_DEPENDENCY", "(null)")
+        print("JOBID NAME STATE REASON DEPENDENCY")
+        print(f"12346 next {state} Dependency {dependency}")
 elif name == "sacct":
     print("JobID|State|ExitCode\n12345|COMPLETED|0:0")
 '''
@@ -150,6 +156,102 @@ class WorkflowTest(unittest.TestCase):
         second = self.run_dir()
         self.assertNotEqual(first, second)
         self.assertEqual(Path(self.cli("path", "12345").stdout.strip()), first)
+
+    def test_continuation_preserves_command_and_captures_predecessor_on_both_clusters(self):
+        code = "import json, os, sys; print(json.dumps([os.environ['EXP_PREDECESSOR_JOB_ID'], os.environ['EXP_PREVIOUS_RUN_DIR'], sys.argv[1:]]))"
+        for profile in ("rohan", "gondor"):
+            with self.subTest(profile=profile):
+                prefix = ("--cluster", profile)
+                self.cli(*prefix, "submit", "train")
+                previous = self.run_dir(*prefix)
+                command = ["python3", "-c", code, "--resume", "--checkpoint-dir", str(previous / "checkpoints")]
+                result = self.cli(*prefix, "submit", "continue-train", "--continue-after", "12345", "--time=24:00:00", "--", *command, env={"MOCK_JOB_ID": "12346"})
+                self.assertEqual(result.stdout, "12346\n")
+                run = self.run_dir(*prefix)
+                self.assertNotEqual(run, previous)
+                args = self.calls("sbatch")[-1]
+                self.assertIn("--dependency=afterany:12345", args)
+                self.assertEqual([a for a in args if a.startswith("--time=")][-1], "--time=24:00:00")
+                self.assertEqual((run / "command.argv").read_bytes().split(b"\0")[:-1], [arg.encode() for arg in command])
+                # A later registry edit must not redirect the queued job's checkpoint lookup.
+                record = self.project / ".slurm" / profile / "jobs/12345"
+                record.write_text(str(run) + "\n")
+                result = self.batch(run, SLURM_JOB_ID="12346")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(json.dumps(["12345", str(previous), command[3:]]), result.stdout)
+
+    def test_external_predecessor_accepts_equals_form_without_adding_resume_arguments(self):
+        self.cli("submit", "external", "--continue-after=98765")
+        run = self.run_dir()
+        self.assertIn("--dependency=afterany:98765", self.calls("sbatch")[-1])
+        command = (run / "command.argv").read_bytes().split(b"\0")[:-1]
+        self.assertEqual(command, [b"bash", str(self.project / "experiments/run.sh").encode()])
+        result = self.batch(run)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("export EXP_PREDECESSOR_JOB_ID=98765\n", (run / "settings.sh").read_text())
+        self.assertIn("export EXP_PREVIOUS_RUN_DIR=''\n", (run / "settings.sh").read_text())
+
+    def test_continuation_dry_run_does_not_submit_or_create_state(self):
+        result = self.cli("submit", "next", "--continue-after=12345", "--dry-run")
+        self.assertIn("--dependency=afterany:12345", result.stdout)
+        self.assertFalse(self.storage.exists())
+        self.assertFalse((self.project / ".slurm").exists())
+        self.assertEqual(self.calls("sbatch"), [])
+
+    def test_invalid_or_conflicting_continuations_never_submit(self):
+        cases = (
+            ("submit", "next", "--continue-after"),
+            ("submit", "next", "--continue-after="),
+            ("submit", "next", "--continue-after", "0"),
+            ("submit", "next", "--continue-after", "-1"),
+            ("submit", "next", "--continue-after", "12345_0"),
+            ("submit", "next", "--continue-after", "not-a-job"),
+            ("submit", "next", "--continue-after", "--dry-run"),
+            ("submit", "next", "--continue-after=12345", "--continue-after", "12346"),
+            ("submit", "next", "--continue-after=12345", "--dependency=afterok:12346"),
+            ("submit", "next", "--dependency=afterok:12346", "--continue-after", "12345"),
+            ("smoke", "--continue-after=12345"),
+            ("interactive", "--continue-after=12345"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                self.assertEqual(self.cli(*args, ok=False).returncode, 2)
+        self.assertEqual(self.calls("sbatch"), [])
+        self.assertEqual(self.calls("srun"), [])
+        self.assertFalse(self.storage.exists())
+
+    def test_continuation_rejects_unavailable_recorded_run_before_submission(self):
+        self.cli("submit", "train")
+        previous = self.run_dir()
+        shutil.rmtree(previous)
+        result = self.cli("submit", "next", "--continue-after=12345", ok=False)
+        self.assertIn("Predecessor run directory is unavailable", result.stderr)
+        self.assertEqual(len(self.calls("sbatch")), 1)
+        self.assertEqual((self.project / ".slurm/local/latest").read_text(), "12345\n")
+
+    def test_raw_dependency_and_ordinary_submission_clear_inherited_predecessor_metadata(self):
+        code = "import json, os; print(json.dumps([os.environ['EXP_PREDECESSOR_JOB_ID'], os.environ['EXP_PREVIOUS_RUN_DIR']]))"
+        self.cli("submit", "evaluate", "--dependency=afterok:12344", "--", "python3", "-c", code,
+                 env={"EXP_PREDECESSOR_JOB_ID": "stale", "EXP_PREVIOUS_RUN_DIR": "/stale/run"})
+        self.assertIn("--dependency=afterok:12344", self.calls("sbatch")[-1])
+        result = self.batch(self.run_dir())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(json.dumps(["", ""]), result.stdout)
+
+    def test_queue_and_status_show_dependencies_for_external_jobs(self):
+        env = {"MOCK_JOB_STATE": "PENDING", "MOCK_JOB_DEPENDENCY": "afterany:12345"}
+        result = self.cli("queue", env=env)
+        self.assertIn("afterany:12345", result.stdout)
+        self.assertTrue(any(arg.startswith("--user=") for arg in self.calls("squeue")[-1]))
+        self.assertTrue(any("%E" in arg for arg in self.calls("squeue")[-1]))
+        result = self.cli("queue", "12346", env=env)
+        self.assertIn("afterany:12345", result.stdout)
+        self.assertIn("--jobs=12346", self.calls("squeue")[-1])
+        self.assertEqual(self.calls("sacct"), [])
+        self.assertFalse((self.project / ".slurm").exists())
+        result = self.cli("status", "12346", env=env)
+        self.assertIn("afterany:12345", result.stdout)
+        self.assertIn("%E", self.calls("squeue")[-1][-1])
 
     def test_cpu_profile_clears_gpu_resources_and_named_profile_wins(self):
         (self.project / "cluster.local.sh").write_text("EXP_PARTITION=stale\nEXP_CONSTRAINT=stale\nEXP_GRES=gpu:8\nEXP_ACCOUNT=research\n")
