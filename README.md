@@ -296,3 +296,79 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests use fake Slurm commands and temporary directories; they do not submit jobs. They exercise submission, continuations and dependency inspection, exact arguments, environment snapshots, arrays, profiles, logs, attach, and failure exit codes. Real cluster scheduling, modules, and GPU compatibility require the compute-node smoke check on your site.
+
+## Operational lessons from the Agent0 runs
+
+### Inspect limits and select a QoS
+
+```bash
+./slurm --cluster gondor limits
+./slurm --cluster gondor submit train --qos=batch-short --mem=256G --time=24:00:00
+```
+
+`limits` queries your account associations, full QoS names, partition settings,
+and node CPU/RAM/GPU inventory. It allocates no resources. Some sites restrict
+accounting visibility; failed queries return a nonzero exit status. A blank QoS
+GPU/CPU limit does not imply unlimited resources: inherited account limits,
+partition limits, allowed QoS, and resource availability still apply.
+`MaxTRESPU` applies across a user's running jobs; `MaxTRESPJ` applies to one job.
+Changing QoS does not increase GPU count or parallelize the application.
+The example's 256G is host RAM, not GPU VRAM, and is not a universal requirement.
+
+Set `EXP_QOS`, `EXP_MEM`, and `EXP_TIME` in `cluster.local.sh` for persistent
+local defaults. Command-line overrides apply to that submission only. Defaults
+also affect other commands, so keep short setup jobs explicit:
+
+```bash
+./slurm --cluster gondor submit install --time=04:00:00 --mem=32G -- bash install.sh
+./slurm --cluster gondor smoke  # Keeps its five-minute smoke default.
+```
+
+`install.sh` is your application's installer; this template does not supply one.
+
+### Follow the correct job and preserve its application checkpoint path
+
+```bash
+./slurm --cluster gondor queue
+./slurm --cluster gondor status 12345
+./slurm --cluster gondor logs 12345
+PREVIOUS_RECEIPT=$(./slurm --cluster gondor path 12345)
+```
+
+The receipt directory is recorded under `.slurm/gondor/jobs/12345`; it is not
+necessarily your application's training run directory. Save the application path
+separately or pass it explicitly to every continuation. `logs` follows both
+stdout and stderr even before files exist. Pending jobs do not create logs until
+Slurm starts them. `CG` means completing/cleanup; disappearing from `squeue`
+does not prove success. `status` includes requested host RAM (`ReqMem`), measured
+`MaxRSS` where available, state, and exit code. Query the failed predecessor's ID,
+not just the latest submission, to find the original error.
+
+### Queue a continuation and recover from failure
+
+```bash
+# Replace these values and train.py with your application's actual interface.
+PREVIOUS_JOB_ID=12345
+TRAINING_RUN_DIR=/shared/path/to/existing/training-run
+./slurm --cluster gondor submit continue-train \
+  --qos=batch-short --mem=256G --time=24:00:00 \
+  --continue-after "$PREVIOUS_JOB_ID" -- \
+  python train.py --resume --run-dir "$TRAINING_RUN_DIR"
+```
+
+The dependency becomes eligible after any predecessor exit, including failure.
+It still waits for available resources. Each submission has a new receipt and
+logs; the explicit application run directory keeps training progress together.
+`--continue-after` does not append resume or retry flags to the application,
+validate its checkpoints, or bypass its failure marker. Agent0's wrapper adds
+resume arguments itself; this generic template intentionally leaves those
+arguments to the application. For success-only work such as evaluation, use
+`--dependency=afterok:12345` instead of `--continue-after`.
+
+If a worker is SIGKILLed and Slurm reports an `oom_kill` event, inspect accounting
+and increase host `--mem` as justified before retrying. A CUDA out-of-memory error
+instead concerns GPU VRAM. Preserve completed checkpoints and inspect the
+original failure before supplying any application-specific retry flag. A planned
+pause may use a nonzero exit code, so inspect the application's saved status as
+well as Slurm's state. This template does not implement application checkpointing
+or automatically resubmit jobs.

@@ -8,6 +8,7 @@ Usage: ./slurm [--cluster local|rohan|gondor|cpu] COMMAND [ARGUMENTS...]
 
   config                              Show effective profile defaults
   doctor                              Check Slurm connection, inventory, storage
+  limits                              Inspect account, QoS, partition and node limits
   smoke [OPTIONS...]                  Submit a five-minute environment check
   submit NAME [OPTIONS...] [-- CMD...] Submit experiment (default: experiments/run.sh)
   interactive [OPTIONS...]            Open a shell in a new allocation
@@ -131,6 +132,20 @@ case "$action" in
         done
         df -h "$EXP_PROJECT_ROOT" "$EXP_RUNS_DIR" "$EXP_CACHE_DIR"
         echo 'Login-node checks passed. Run ./slurm smoke to check a compute node.' ;;
+    limits)
+        (( $# == 0 )) || die 'limits takes no arguments; choose a partition via cluster.local.sh or a profile.'
+        need sacctmgr; need scontrol; need sinfo
+        failed=0
+        echo 'Account associations (parent associations may impose additional limits):'
+        sacctmgr show assoc where user="$(id -un)" \
+            format=Cluster,Account,Partition,QOS%60,DefaultQOS,GrpTRES%50,MaxTRES%50 || failed=1
+        echo 'QoS: MaxTRESPU is per user; MaxTRESPJ is per job; MaxWall is per job runtime.'
+        sacctmgr show qos format=Name%24,MaxTRESPU%50,MaxTRESPJ%50,GrpTRES%50,MaxWall || failed=1
+        echo "Partition: $EXP_PARTITION"
+        scontrol show partition "$EXP_PARTITION" || failed=1
+        sinfo -N -o '%N %P %t %c %m %G %f' || failed=1
+        echo 'Blank fields mean no limit at that level, not unlimited access. Check allowed QoS and inherited account/partition limits.'
+        exit "$failed" ;;
     submit) submit "$@" ;;
     smoke)
         parse_options "$@"
@@ -168,7 +183,7 @@ case "$action" in
         need squeue
         squeue -j "$job_id" -o '%.18i %.12P %.9T %.10M %.40R %E' || echo 'Queue query failed; checking accounting.' >&2
         if command -v sacct >/dev/null 2>&1; then
-            sacct -j "$job_id" --format=JobID,JobName,State,Elapsed,MaxRSS,AllocTRES,ExitCode -P
+            sacct -j "$job_id" --format=JobID,JobName,State,Elapsed,ReqMem,MaxRSS,AllocTRES,ExitCode -P
         else
             echo 'sacct is unavailable; ask your site how to view completed jobs.' >&2
         fi ;;
@@ -187,8 +202,15 @@ case "$action" in
         fi
         [[ "$array" == true || "$job_id" != *_* ]] || die 'This job is not an array.'
         if [[ "$follow" == true ]]; then
-            echo 'Ctrl-C stops viewing. The job keeps running; pending jobs may not have logs yet.' >&2
+            echo "Job $job_id; run directory: $run_dir" >&2
+            echo 'Following stdout and stderr. Ctrl-C stops viewing; the job keeps running.' >&2
+            if [[ ! -f "$run_dir/logs/$job_id.out" || ! -f "$run_dir/logs/$job_id.err" ]]; then
+                echo 'Waiting for log files; Slurm creates them when the job starts. Use ./slurm queue to inspect pending reasons.' >&2
+            fi
             exec tail -n 60 -F -- "$run_dir/logs/$job_id.out" "$run_dir/logs/$job_id.err"
+        fi
+        if [[ ! -f "$run_dir/logs/$job_id.out" || ! -f "$run_dir/logs/$job_id.err" ]]; then
+            die "Log files are not available yet for $job_id. Use ./slurm queue $job_id or omit --once to wait."
         fi
         exec tail -n 60 -- "$run_dir/logs/$job_id.out" "$run_dir/logs/$job_id.err" ;;
     attach)

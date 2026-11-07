@@ -53,7 +53,7 @@ class WorkflowTest(unittest.TestCase):
         self.storage = self.base / "shared storage"
         self.bin = self.base / "bin"
         self.bin.mkdir()
-        for name in ("sbatch", "srun", "squeue", "sacct", "scancel", "scontrol", "sinfo"):
+        for name in ("sbatch", "srun", "squeue", "sacct", "scancel", "scontrol", "sinfo", "sacctmgr"):
             script = self.bin / name
             script.write_text(MOCK)
             script.chmod(0o755)
@@ -297,6 +297,29 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("COMPLETED", self.cli("status").stdout)
         self.cli("cancel")
         self.assertEqual(self.calls("scancel"), [["12345"]])
+
+    def test_limits_inspects_associations_qos_and_partition_without_submission(self):
+        result = self.cli("--cluster", "gondor", "limits")
+        self.assertIn("not unlimited access", result.stdout)
+        self.assertEqual(len(self.calls("sacctmgr")), 2)
+        self.assertIn("qos", self.calls("sacctmgr")[-1])
+        self.assertIn("gpu", self.calls("scontrol")[-1])
+        self.assertEqual(self.calls("sbatch"), [])
+        self.assertFalse((self.project / ".slurm").exists())
+
+    def test_missing_logs_once_reports_pending_guidance(self):
+        self.cli("submit", "pending")
+        result = self.cli("logs", "--once", ok=False)
+        self.assertIn("omit --once to wait", result.stderr)
+        self.assertNotIn("cannot open", result.stderr)
+
+    def test_status_includes_requested_memory_and_qos_override_is_forwarded(self):
+        self.cli("--cluster", "gondor", "submit", "train", "--qos=batch-short", "--mem=256G", "--time=24:00:00")
+        args = self.calls("sbatch")[-1]
+        for option in ("--qos=batch-short", "--mem=256G", "--time=24:00:00"):
+            self.assertIn(option, args)
+        self.cli("--cluster", "gondor", "status")
+        self.assertIn("ReqMem", self.calls("sacct")[-1][-2])
 
     def test_attach_uses_snapshot_and_requires_running(self):
         activation = self.project / "environment.local.sh"
