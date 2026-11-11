@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+gpu=false
+arguments=()
+while (( $# )); do
+    case "$1" in
+        -h|--help)
+            echo 'Usage: ./scripts/attach [JOB_ID] [--gpu | -- COMMAND ...]'
+            echo 'Opens a shell by default. --gpu refreshes nvidia-smi every second.'
+            exit 0 ;;
+        --gpu) gpu=true ;;
+        --)
+            if [[ "$gpu" == true ]]; then
+                echo 'Choose --gpu or a command after --.' >&2
+                exit 2
+            fi
+            arguments+=("$@")
+            break ;;
+        *) arguments+=("$1") ;;
+    esac
+    shift
+done
+if [[ "$gpu" == true ]]; then arguments+=(-- watch -n 1 nvidia-smi); fi
+exec "$script_dir/../slurm" attach "${arguments[@]}"
